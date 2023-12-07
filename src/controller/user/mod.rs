@@ -1,3 +1,7 @@
+use anyhow::Context;
+
+mod auth;
+
 #[derive(sqlx::FromRow)]
 pub struct RawUser {
     pub id: i64,
@@ -16,7 +20,7 @@ pub struct UserController {
 
 impl UserController {
     pub async fn get_user_by_username<T: From<RawUser>>(&self, username: impl AsRef<str>) -> anyhow::Result<T> {
-        let username = username.into();
+        let username = username.as_ref();
         let user = sqlx::query_as::<_, RawUser>(
             r#"
             SELECT id, username, password
@@ -36,32 +40,40 @@ impl UserController {
             r#"
             UPDATE users
             SET username = ?
-            WHERE id = ?
+            WHERE id = ? AND username = ?
             "#,
         )
             .bind(&user.username)
             .bind(&user.id)
+            .bind(&user.username)
             .execute(&self.db.0)
             .await?;
 
         Ok(())
     }
 
-    pub async fn update_user_password(user_id: i64, username: &str, password: impl AsRef<str>) -> anyhow::Result<()> {
-        // let password = crate::api::auth::hash_password(password)?;
-        // sqlx::query(
-        //     r#"
-        //     UPDATE users
-        //     SET password = ?
-        //     WHERE id = ? AND username = ?
-        //     "#,
-        // )
-        //     .bind(&password)
-        //     .bind(&user_id)
-        //     .bind(&username)
-        //     .execute(&self.db.0)
-        //     .await?;
-        //
-        // Ok(())
+    pub async fn update_user_password(&self,
+                                      user_id: i64,
+                                      username: &str,
+                                      password: impl AsRef<str>,
+                                      current_password: impl AsRef<str>,
+    ) -> anyhow::Result<()> {
+        let password = password.as_ref();
+        let password = auth::hash_password(password)
+            .context("Failed to hash password")?;
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET password = ?
+            WHERE id = ? AND username = ?
+            "#,
+        )
+            .bind(&password)
+            .bind(&user_id)
+            .bind(&username)
+            .execute(&self.db.0)
+            .await?;
+
+        Ok(())
     }
 }

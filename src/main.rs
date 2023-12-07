@@ -1,5 +1,9 @@
-use anyhow::Context;
+extern crate core;
 
+use anyhow::Context;
+use axum::{Extension, Router};
+
+mod util;
 mod api;
 pub(crate) mod controller;
 
@@ -14,8 +18,16 @@ async fn main() -> anyhow::Result<()> {
         .run(&sqlite_pool)
         .await
         .context("Failed to run migrations")?;
+    let db = DB(sqlite_pool);
 
-    println!("Hello, world!");
+    let redis = redis::Client::open("redis://127.0.0.1/")
+        .context("unable to create redis client")?;
+    let redis = Redis(redis);
+
+    let app = Router::new()
+        .nest("/api", api::api())
+        .layer(Extension(db))
+        .layer(Extension(redis));
 
     Ok(())
 }
@@ -28,4 +40,12 @@ fn envs() {
 
 
 pub type DbPool = sqlx::SqlitePool;
+#[derive(Clone)]
 pub struct DB(DbPool);
+#[derive(Clone)]
+pub struct Redis(redis::Client);
+
+pub struct AppData {
+    pub db: DB,
+    pub redis: Redis,
+}

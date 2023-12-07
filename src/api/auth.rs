@@ -1,44 +1,156 @@
-use anyhow::{anyhow, Context};
-use argon2::Argon2;
-use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use password_hash::rand_core::OsRng;
+use std::task::{Context, Poll};
+use axum::{async_trait, Extension, RequestExt};
+use axum::extract::Request;
+use axum::http::{StatusCode};
+use axum::http::request::Parts;
+use axum::response::Response;
+use axum_core::body::Body;
+use futures::future::BoxFuture;
+use tower::{Layer, Service};
+use crate::controller::session::Session;
+use crate::Redis;
 
-pub fn hash_password(password: impl AsRef<[u8]>) -> anyhow::Result<String> {
-    let pepper = pepper_password(password)?;
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    argon2.hash_password(pepper.as_bytes(), &salt)
-        .map_err(|e| anyhow!("Failed to hash password: {}", e))
-        .map(|hash| hash.to_string())
-}
+#[derive(Debug, Clone)]
+pub struct Authenticator;
 
-pub fn verify_password(password: impl AsRef<[u8]>, hash: impl AsRef<str>) -> anyhow::Result<bool> {
-    let hash = PasswordHash::new(hash.as_ref())
-        .map_err(|e| anyhow!("Failed to parse password hash: {}", e))?;
-    let peppered_password = pepper_password(password)?;
+impl<S> Layer<S> for Authenticator {
+    type Service = AuthService<S>;
 
-    let argon2 = Argon2::default();
-    match argon2.verify_password(peppered_password.as_bytes(), &hash) {
-        Ok(()) => Ok(true),
-        Err(e) if matches!(e, password_hash::Error::Password) => Ok(false),
-        Err(e) => Err(anyhow!("Failed to verify password: {}", e)),
+    fn layer(&self, inner: S) -> Self::Service {
+        AuthService {
+            inner,
+        }
     }
 }
 
-fn pepper_password(password: impl AsRef<[u8]>) -> anyhow::Result<String> {
-    let password = password.as_ref();
-    let pepper = pepper()
-        .context("Failed to get password pepper")?;
-    let argon2 = Argon2::default();
-    argon2.hash_password(password.as_ref(), &pepper)
-        .map_err(|e| anyhow!("Failed to hash password: {}", e))
-        .map(|hash| hash.to_string())
+#[derive(Debug, Clone)]
+pub struct AuthService<S> {
+    inner: S,
 }
 
-fn pepper() -> anyhow::Result<SaltString> {
-    let pepper = std::env::var("PASSOWRD_PEPPER")
-        .context("PASSWORD_PEPPER must be set & must be 48 bytes long")?;
+#[derive(Clone)]
+pub struct AuthSession(pub Session);
 
-    SaltString::encode_b64(pepper.as_bytes())
-        .map_err(|e| anyhow!("Failed to encode password pepper: {}", e))
+
+impl<S> Service<Request> for AuthService<S>
+    where
+        S: Service<Request, Response=Response> + Clone + Send + 'static,
+        S::Future: Send + 'static
+{
+    type Response = Response;
+    type Error = S::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request) -> Self::Future {
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            let session_id = {
+                let Some(session_id) = req.headers().get("X-Grey-Session-Id") else {
+                    return inner.call(req).await;
+                };
+
+                // todo: better error messages
+                let Ok(value) = session_id.to_str() else {
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Default::default())
+                        .unwrap());
+                };
+
+                let Some(session_id) = value.strip_prefix("Bearer ") else {
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Default::default())
+                        .unwrap());
+                };
+
+                session_id.to_string()
+            };
+
+            let Extension(redis): Extension<Redis> = req.extract_parts()
+                .await
+                .expect("Redis extension is missing");
+
+            let controller = crate::controller::session::SessionController::new(redis);
+
+            let Some(session) = controller.get_session(&session_id).await.ok() else {
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(Default::default())
+                    .unwrap());
+            };
+
+            let Some(value) = req.headers().get("X-Grey-Session-Key") else {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Default::default())
+                    .unwrap());
+            };
+
+            let Ok(session_key) = value.to_str() else {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Default::default())
+                    .unwrap());
+            };
+
+            if session.session_key() != session_key {
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(Default::default())
+                    .unwrap());
+            }
+
+            if session.expires_at() < chrono::Utc::now() {
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(Default::default())
+                    .unwrap());
+            }
+
+            req.extensions_mut().insert(AuthSession(session));
+
+            inner.call(req).await
+        })
+    }
+}
+
+pub struct Auth(pub Session);
+
+pub struct DenyAuth;
+
+#[async_trait]
+impl<S> axum::extract::FromRequestParts<S> for Auth {
+    type Rejection = Response<Body>;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        if let Some(session) = parts.extensions.get::<AuthSession>() {
+            return Ok(Auth(session.0.clone()));
+        } else {
+            return Err(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Default::default())
+                .unwrap());
+        }
+    }
+}
+
+#[async_trait]
+impl<S> axum::extract::FromRequestParts<S> for DenyAuth {
+    type Rejection = Response<Body>;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        if parts.extensions.get::<AuthSession>().is_some() {
+            Err(Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body("This resource is forbidden for session users".into())
+                .unwrap())
+        } else {
+            Ok(DenyAuth)
+        }
+    }
 }
