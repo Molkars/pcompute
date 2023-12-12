@@ -27,24 +27,16 @@ pub struct SessionController {
     redis: crate::Redis,
 }
 
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    #[error("Session not found")]
-    NotFound,
-    #[error("Failed to get session")]
-    Redis(#[from] redis::RedisError),
-    #[error("Failed to encode session")]
-    Json(#[from] serde_json::Error),
-}
-
 impl SessionController {
+    pub const SESSION_COOKIE_NAME: &'static str = "Grey-Session-Id";
+
     pub fn new(redis: crate::Redis) -> Self {
         Self {
             redis
         }
     }
 
-    pub async fn create_session(&self, user_id: i64) -> Result<Session, Error> {
+    pub async fn create_session(&self, user_id: i64) -> anyhow::Result<Session> {
         let session = Session {
             user_id,
             session_id: crate::util::rand::random_string_with_prefix(32, "session"),
@@ -66,33 +58,33 @@ impl SessionController {
         Ok(session)
     }
 
-    pub async fn get_session(&self, session_id: &str) -> Result<Session, Error> {
+    pub async fn get_session(&self, session_id: &str) -> anyhow::Result<Option<Session>> {
         let mut conn = self.redis.0.get_async_connection().await?;
         let session_json: Option<String> = redis::cmd("GET")
             .arg(format!("session:{}", session_id))
             .query_async(&mut conn)
             .await?;
 
-        let Some(session_json) = session_json else {
-            return Err(Error::NotFound);
-        };
-
-        let session: Session = crate::util::convert::json_decode(&session_json)?;
-
-        if session.expires_at < chrono::Utc::now() {
-            let _: () = redis::cmd("DEL")
-                .arg(format!("session:{}", session_id))
-                .query_async(&mut conn)
-                .await?;
-            return Err(Error::NotFound);
+        match session_json {
+            None => Ok(None),
+            Some(session_json) => {
+                let session: Session = crate::util::convert::json_decode(&session_json)?;
+                if session.expires_at < chrono::Utc::now() {
+                    redis::cmd("DEL")
+                        .arg(format!("session:{}", session_id))
+                        .query_async(&mut conn)
+                        .await?;
+                    Ok(None)
+                } else {
+                    Ok(Some(session))
+                }
+            }
         }
-
-        Ok(session)
     }
 
-    pub async fn delete_session(&self, session_id: &str) -> Result<(), Error> {
+    pub async fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
         let mut conn = self.redis.0.get_async_connection().await?;
-        let _: () = redis::cmd("DEL")
+        redis::cmd("DEL")
             .arg(format!("session:{}", session_id))
             .query_async(&mut conn)
             .await?;

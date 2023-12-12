@@ -1,0 +1,15 @@
+<h1>Login</h1>
+<form hx-post="/auth/login" hx-target="#root" hx-swap="outerHtml">
+    <div>
+        <label>
+            <input type="text" name="username" placeholder="Username" value="{{ self.username }}">
+        </label>
+        <label>
+            <input type="password" name="password" placeholder="Password">
+        </label>
+    </div>
+    <div>
+        <input type="submit" value="Login">
+    </div>
+</form>
+<div id="error">{{ self.error }}</div>
